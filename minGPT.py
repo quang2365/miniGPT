@@ -1,8 +1,12 @@
+import argparse
 import torch 
 import torch.nn as nn
 from torch.nn import functional as F
-from BPEtokenizer import BPETokenizer
-
+from BPE import BPE
+from tokenizers import Tokenizer
+from GQA import GroupedQueryAttention
+from SwiGLU import SwiGLU
+from RMSNorm import RMSNorm
 
 #========================================================
 # Hyperparameters========================================
@@ -10,43 +14,34 @@ from BPEtokenizer import BPETokenizer
 
 
 
-batch_size = 32
-block_size = 64
+batch_size = 16
+block_size = 256
 
-n_emb = 128
-n_head = 4
-n_layer = 4
+n_emb = 512
+n_layer = 12
 
-learning_rate = 3e-4
+n_query_heads = 8
+n_key_value_heads = 4
 
-max_steps = 5000
-
+learning_rate = 1e-4
+max_steps = 10000
 
 eval_interval = 500
-
 eval_iters = 100
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-#=========================================================
-# Read raw-text===========================================
-#=========================================================
-
-
-
-
-
-
-
-#===================================================================
-#Split Data ========================================================
-#===================================================================
-
-
-#===================================================================
-#Get batch =========================================================
-#===================================================================
-
+def apply_p (logits, top_p):
+    sorted_logits, sorted_indices = torch.sort(logits,descending=True,dim=-1)
+    soft_max = F.softmax(sorted_logits,dim=-1)
+    cumulative_probs = torch.cumsum(soft_max,dim=-1)
+    sorted_remove = cumulative_probs > top_p
+    sorted_remove[:,1:] = sorted_remove[:,:-1].clone() 
+    sorted_remove[:, 0] = False
+    remove_mask = torch.zeros_like(logits,dtype=torch.bool)
+    remove_mask.scatter_(dim=-1,index=sorted_indices,src=sorted_remove)
+    logits = logits.masked_fill(remove_mask, float('-inf'))
+    return logits
 def get_batch(split):
     if split == "train":
         data_source = train_data
@@ -62,88 +57,41 @@ def get_batch(split):
     y = y.to(device)
 
     return x,y
-class Single_head_attention(nn.Module):
-    def __init__(self,n_emb_C, head_size, block_size):
-        super().__init__()
-        self.head_size = head_size
-        self.query = nn.Linear(n_emb_C,head_size,bias = False)
-        self.key = nn.Linear(n_emb_C,head_size,bias = False)
-        self.value = nn.Linear(n_emb_C,head_size,bias = False)
-
-        self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))
-    def forward(self,x):
-        B,T,H = x.shape
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-        # can use T insteal self.head_size
-        attention_weight = (q @ (k.transpose(-2,-1)))/self.head_size ** 0.5
-
-        attention_weight = attention_weight.masked_fill(self.tril[:T,:T] == 0, float('-inf'))
-
-        attention_weight = F.softmax(attention_weight, dim = -1)
-
-        output = attention_weight @ v
-
-        return output
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self,n_emb_C,n_head_H,block_size):
-        super().__init__()
-        assert( n_emb_C % n_head_H == 0 )
-        head_size = n_emb_C // n_head_H
-
-        self.heads = nn.ModuleList([Single_head_attention(n_emb_C,head_size,block_size) for _ in range(n_head_H)])
-        #use this after concat
-        self.projection = nn.Linear(n_emb_C,n_emb_C)\
-
-    def forward(self,x):
-
-        out = torch.cat([head(x) for head in self.heads], dim= -1
-        
-    ) 
-
-        return self.projection(out)
 
 class FeedFowardNetwork(nn.Module):
-    def __init__(self, n_emb_C):
+    def __init__(self, n_emb_C, hidden_dim = None):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(n_emb_C,n_emb_C*4),
-            nn.GELU(),
-            nn.Linear(n_emb_C*4,n_emb_C)
-        )
+        self.net = SwiGLU(n_emb_C, hidden_dim)
     def forward(self,x):
         return self.net(x)
 
 
 class Blocks(nn.Module):
-    def __init__(self,n_emb_C,n_head_H,block_size):
+    def __init__(self,n_emb_C,hidden_dim,n_query_heads,n_key_value_heads,block_size):
         super().__init__()
-        self.self_attention = MultiHeadAttention(n_emb_C,n_head_H,block_size)
+        self.self_attention = GroupedQueryAttention(n_emb_C,n_query_heads,n_key_value_heads,block_size)
 
-        self.feed_forward = FeedFowardNetwork(n_emb_C)
+        self.feed_forward = FeedFowardNetwork(n_emb_C,hidden_dim)
 
-        self.layer_norm_1 = nn.LayerNorm(n_emb_C)
+        self.RMSNorm_1 = RMSNorm(n_emb_C)
 
-        self.layer_norm_2 = nn.LayerNorm(n_emb_C)
+        self.RMSNorm_2 = RMSNorm(n_emb_C)
     def forward(self,x):
 
-        x = x + self.self_attention(self.layer_norm_1(x))
+        x = x + self.self_attention(self.RMSNorm_1(x))
 
-        x = x + self.feed_forward(self.layer_norm_2(x))
+        x = x + self.feed_forward(self.RMSNorm_2(x))
 
         return x
-
-    
-    
 class MiniChatGPT(nn.Module):
     def __init__(self,  
         vocal_size_v,
         block_size,
+        hidden_dim,
         n_emb_C,
-        n_head_H,
+        n_query_heads,
+        n_key_value_heads,
         n_layer
     ):
         super().__init__()
@@ -154,7 +102,7 @@ class MiniChatGPT(nn.Module):
 
         self.position_embedding = nn.Embedding(block_size,n_emb_C)
 
-        self.blocks = nn.Sequential(*[Blocks(n_emb_C,n_head_H,block_size) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Blocks(n_emb_C,hidden_dim,n_query_heads,n_key_value_heads,block_size) for _ in range(n_layer)])
 
         self.ln_f = nn.LayerNorm(n_emb_C)
 
@@ -191,18 +139,28 @@ class MiniChatGPT(nn.Module):
 
         return logits,loss
     @torch.no_grad()
-    def generate(self, idx, max_new_token):
+    def generate(self, idx, max_new_token,top_p = None,top_k = None,temperature = 1,do_sample = True):
+
 
         for _ in range(max_new_token):
             idx_cond = idx[:,-self.block_size:]
 
             logits,_ = self(idx_cond)
 
-            logit = logits[:,-1,:]
-
-            probs = F.softmax(logit,dim=-1)
-
-            idx_next = torch.multinomial(probs,num_samples=1)
+            logits = logits[:,-1,:]
+            if not do_sample:
+                idx_next = torch.argmax(logits,dim = -1,keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k:
+                    k = min(top_k, logits.size(-1))   
+                    top_values,_ = torch.topk(logits,k=k,dim=-1)
+                    thread_hold = (top_values[:,-1].unsqueeze(-1))
+                    logits = logits.masked_fill(logits < thread_hold, float('-inf'))
+                if top_p and 0 < top_p < 1.0:
+                    logits = apply_p(logits,top_p)
+                probs = F.softmax(logits,dim=-1)
+                idx_next = torch.multinomial(probs,num_samples=1)
 
             idx = torch.cat((idx,idx_next), dim = 1)
 
@@ -220,7 +178,7 @@ def save_checkpoint(
     model,
     optimizer,
     tokenizer,
-    step
+    step,
 ):
     checkpoint = {
         "model_state_dict":
@@ -232,31 +190,31 @@ def save_checkpoint(
         "step": step,
 
         "config": {
-            "vocab_size": vocab_size,
-            "block_size": block_size,
-            "n_emb": n_emb,
-            "n_head": n_head,
-            "n_layer": n_layer,
+            "vocab_size":
+                tokenizer.get_vocab_size()
+                if hasattr(tokenizer, "get_vocab_size")
+                else tokenizer.vocab_size,
+
+            "block_size":
+                block_size,
+
+            "n_emb":
+                n_emb,
+
+            "n_query_heads":
+                n_query_heads,
+
+            "n_key_value_heads":
+                n_key_value_heads,
+
+            "n_layer":
+                n_layer,
         },
-
-        "tokenizer": {
-            "num_merges":
-                tokenizer.num_merges,
-
-            "merges":
-                tokenizer.merges,
-
-            "token_to_id":
-                tokenizer.token_to_id,
-
-            "id_to_token":
-                tokenizer.id_to_token,
-        }
     }
 
     torch.save(
         checkpoint,
-        path
+        path,
     )
 @torch.no_grad()
 def estimate_loss():
@@ -272,9 +230,66 @@ def estimate_loss():
         out[split] = losses.mean().item()      
     model.train()     
     return out
+
+
+def load_tokenizer(name, path):
+    """Load one of the supported tokenizers and expose a common interface."""
+    if name == "hf":
+        tokenizer = Tokenizer.from_file(path)
+        vocab_size = tokenizer.get_vocab_size()
+        encode = lambda text: tokenizer.encode(text).ids
+        decode = lambda ids: tokenizer.decode(ids, skip_special_tokens=False)
+    elif name == "custom-bpe":
+        tokenizer = BPE.load(path)
+        vocab_size = tokenizer.vocab_size
+        encode = tokenizer.encode
+        decode = tokenizer.decode
+    else:
+        raise ValueError(f"Unknown tokenizer: {name}")
+    return tokenizer, vocab_size, encode, decode
+
+
 if __name__ == "__main__":
-    with open("./clawer/input.txt","r",encoding = "utf-8") as f:
-        text = f.read()
+    parser = argparse.ArgumentParser(description="Train MiniGPT")
+    parser.add_argument(
+        "--tokenizer", choices=["hf", "custom-bpe"], default="hf",
+        help="Tokenizer backend (default: hf)",
+    )   
+    parser.add_argument(
+        "--tokenizer-path", default="./tokenizer/tokenizer_hf.json",
+        help="Path to the tokenizer JSON/model file",
+    )
+    parser.add_argument(
+        "--input", default="./clawer/input_hf.txt",
+        help="Training text file",
+    )
+    args = parser.parse_args()
+
+    print(f"[MiniGPT] loading tokenizer: {args.tokenizer} -> {args.tokenizer_path}", flush=True)
+    tokenizer, vocab_size, encode_text, decode_text = load_tokenizer(
+        args.tokenizer, args.tokenizer_path
+    )
+    print(f"[MiniGPT] tokenizer loaded, vocab_size={vocab_size:,}", flush=True)
+
+    # Build the model before tokenizing the corpus so startup reports its
+    # parameter count immediately, even when custom BPE encoding is slow.
+    model = MiniChatGPT(
+        vocal_size_v=vocab_size,
+        block_size=block_size,
+        n_emb_C=n_emb,
+        n_query_heads=n_query_heads,
+        n_key_value_heads=n_key_value_heads,
+        n_layer=n_layer,
+        hidden_dim=None,
+    ).to(device)
+    num_parameters = sum(p.numel() for p in model.parameters())
+    print(f"[MiniGPT] device={device} | parameters={num_parameters:,}", flush=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    print(f"[MiniGPT] reading input: {args.input}", flush=True)
+    with open(args.input, "r", encoding="utf-8") as f:
+        texts = f.read()
+    print(f"[MiniGPT] input loaded: {len(texts):,} characters", flush=True)
 
 
 
@@ -282,18 +297,9 @@ if __name__ == "__main__":
     # Encoding================================================
     #=========================================================
 
-
-
-    tokenizer = BPETokenizer(
-        num_merges=100
-    )
-    tokenizer.fit(
-        text.splitlines()
-    )
-
-    vocab_size = tokenizer.vocab_size
-
-    token_ids = tokenizer.encode(text)
+    print("[MiniGPT] encoding corpus...", flush=True)
+    token_ids = encode_text(texts)
+    print(f"[MiniGPT] encoding done: {len(token_ids):,} tokens", flush=True)
 
     data = torch.tensor(token_ids, dtype=torch.long)
 
@@ -301,27 +307,6 @@ if __name__ == "__main__":
 
     train_data = data[:n]
     val_data = data[n:]
-
-    model = MiniChatGPT(vocal_size_v = vocab_size,
-        block_size = block_size,
-        n_emb_C = n_emb,
-        n_head_H = n_head,
-        n_layer = n_layer)
-
-    model = model.to(device)
-    num_parameters = sum(
-        p.numel()
-        for p in model.parameters()
-    )
-
-    optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=learning_rate
-)
-    print(
-        f"Model parameters: "
-        f"{num_parameters:,}"
-    )
 
     for step in range(max_steps):
         model.train()
@@ -333,7 +318,7 @@ if __name__ == "__main__":
                 tokenizer,
                 step
             )
-        if step % eval_interval == 0:
+        if step % eval_iters == 0:
             losses = estimate_loss()
             print(
                 f"step {step:5d} | "
@@ -345,7 +330,7 @@ if __name__ == "__main__":
 
         xb,yb = get_batch('train')
 
-        logits,loss,_ = model(xb,yb)
+        logits,loss = model(xb,yb)
 
         optimizer.zero_grad()
         

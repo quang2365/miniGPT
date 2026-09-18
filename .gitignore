@@ -1,0 +1,30 @@
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Large model/checkpoint artefacts
+models/
+*.pt
+*.pth
+*.safetensors
+my_lora_adapter/
+qlora_output/
+tokenizer/
+
+# Crawled/generated data and logs
+clawer/data/raw/
+clawer/data/cleaned/
+clawer/data/
+clawer/data/*.jsonl
+clawer/data/*.parquet
+clawer/data/*.tmp
+clawer/input*.txt
+input.txt
+*.log
+
+# Local notebooks and temporary files
+.ipynb_checkpoints/
+*.ipynb
+*.tmp
